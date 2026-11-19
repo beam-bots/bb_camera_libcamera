@@ -10,3 +10,8 @@ All notable changes to this project will be documented in this file.
 See [Conventional Commits](Https://conventionalcommits.org) for commit guidelines.
 
 <!-- changelog -->
+
+## [v0.1.0](https://github.com/beam-bots/bb_camera_libcamera/compare/v0.1.0...v0.1.0) (2026-11-19)
+
+
+
