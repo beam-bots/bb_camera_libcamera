@@ -1,0 +1,31 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 James Harton
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Stands in for `rpicam-vid --list-cameras`, replaying what a Pi 5 with two
+# imx219s printed while the first was capturing in another process - which is
+# why its modes are unreadable.
+
+if [ "$1" != "--list-cameras" ]; then
+  echo "fake_rpicam_vid only lists cameras" >&2
+  exit 64
+fi
+
+cat <<'LISTING'
+Available cameras
+-----------------
+0 : imx219 [3280x2464 10-bit] (/base/axi/pcie@1000120000/rp1/i2c@88000/imx219@10)
+           'SBGGR8' : 640x480 [30.00 fps - (65535, 65535)/65535x65535 crop]
+
+1 : imx219 [3280x2464 10-bit RGGB] (/base/axi/pcie@1000120000/rp1/i2c@80000/imx219@10)
+    Modes: 'SRGGB10_CSI2P' : 640x480 [103.33 fps - (1000, 752)/1280x960 crop]
+                             1640x1232 [41.85 fps - (0, 0)/3280x2464 crop]
+                             1920x1080 [47.57 fps - (680, 692)/1920x1080 crop]
+                             3280x2464 [21.19 fps - (0, 0)/3280x2464 crop]
+           'SRGGB8' : 640x480 [103.33 fps - (1000, 752)/1280x960 crop]
+                      1640x1232 [41.85 fps - (0, 0)/3280x2464 crop]
+                      1920x1080 [47.57 fps - (680, 692)/1920x1080 crop]
+                      3280x2464 [21.19 fps - (0, 0)/3280x2464 crop]
+
+LISTING
