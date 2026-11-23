@@ -52,9 +52,9 @@ if Code.ensure_loaded?(Igniter) do
 
     defp param_group_body do
       """
-      param :width, type: :integer, default: 640, doc: "Width in pixels to ask the camera for"
+      param :width, type: :integer, default: 640, doc: "Width in pixels; a multiple of 128"
 
-      param :height, type: :integer, default: 480, doc: "Height in pixels to ask the camera for"
+      param :height, type: :integer, default: 480, doc: "Height in pixels; even"
       """
     end
 

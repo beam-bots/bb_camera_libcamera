@@ -52,13 +52,6 @@ defmodule BB.Camera.Libcamera.CommandTest do
       assert {:error, {:invalid_frame_rate, {30, 0}}} = Command.new(options(frame_rate: {30, 0}))
     end
 
-    test "bounds quality to libjpeg's range" do
-      assert {:ok, _command} = Command.new(options(quality: 1))
-      assert {:ok, _command} = Command.new(options(quality: 100))
-      assert {:error, {:invalid_quality, 0}} = Command.new(options(quality: 0))
-      assert {:error, {:invalid_quality, 101}} = Command.new(options(quality: 101))
-    end
-
     test "rejects flips and buffer counts of the wrong type" do
       assert {:error, {:invalid_flip, "yes"}} = Command.new(options(hflip: "yes"))
       assert {:error, {:invalid_flip, nil}} = Command.new(options(vflip: nil))
@@ -81,12 +74,21 @@ defmodule BB.Camera.Libcamera.CommandTest do
       refute Enum.any?(argv, &String.contains?(&1, "i2c@"))
     end
 
-    test "writes MJPEG to stdout, flushed per frame, with no preview window" do
+    test "writes unencoded YUV420 to stdout, flushed per frame, with no preview window" do
       argv = argv()
 
-      assert ["--codec", "mjpeg"] == Enum.drop_while(argv, &(&1 != "--codec")) |> Enum.take(2)
+      assert ["--codec", "yuv420"] == Enum.drop_while(argv, &(&1 != "--codec")) |> Enum.take(2)
       assert Enum.take(argv, -3) == ["--flush", "--output", "-"]
       assert "--nopreview" in argv
+      refute "--quality" in argv
+    end
+
+    test "never asks for anything else on stdout" do
+      argv = argv(hflip: true, vflip: true, buffer_count: 2)
+
+      refute "--metadata" in argv
+      refute "--keypress" in argv
+      assert ["--verbose", "0"] == Enum.drop_while(argv, &(&1 != "--verbose")) |> Enum.take(2)
     end
 
     test "runs until stopped" do

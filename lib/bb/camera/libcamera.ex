@@ -46,20 +46,32 @@ defmodule BB.Camera.Libcamera do
 
   ## What it captures
 
-  JPEG, encoded in software by `rpicam-vid`. A Pi camera produces raw Bayer
-  data, the Pi's ISP turns it into YUV, and `rpicam-vid` encodes that with
-  libjpeg, so every frame costs CPU in proportion to its size. `:quality`
-  trades size for fidelity.
+  Raw `{:raw, :I420}` frames at exactly the configured width and height. A Pi
+  camera produces raw Bayer data and the Pi's ISP turns it into YUV;
+  `rpicam-vid --codec yuv420` writes those YUV buffers to its stdout untouched,
+  so nothing is encoded and nothing needs decoding. There is no software JPEG
+  encode on the Pi's CPU, and no decode by whoever consumes the frames.
+
+  `rpicam-vid` configures the camera with the JPEG colour space for this codec,
+  so the YUV is full-range BT.601 (sYCC), not the limited range most video
+  uses.
+
+  ### Width must be a multiple of 128
+
+  `rpicam-vid` writes each ISP buffer whole, row padding included, and never
+  says how wide a padded row is. The Pi 4's ISP pads rows of the luma plane to
+  a multiple of 64 bytes and the Pi 5's to a multiple of 128, so a frame is
+  tightly packed `:I420` - and the stream can be cut into frames by size - only
+  when the width is a multiple of 128. 640, 1280 and 1920 are; 800 is not. The
+  height must be even, as `:I420`'s chroma is subsampled vertically. Any other
+  size is refused up front with `BB.Error.Invalid.Camera.UnsupportedFormat`,
+  reason `:invalid_dimensions`, rather than captured as garbage.
 
   ## What it reports
 
-  Capture is confirmed to the hub on the **first whole image**, not when
+  Capture is confirmed to the hub on the **first whole frame**, not when
   `rpicam-vid` starts. A camera that is missing, busy, or cannot get buffers
   would otherwise announce `BeginCapture` a moment before failing.
-
-  Dimensions come from the `SOF` marker of each frame, which is what was
-  actually encoded, and `BB.Camera.stream_info/2` reports those once capture
-  has produced something.
 
   The frame rate in `stream_info` is the one that was **requested**. libcamera
   is asked for it, and chooses a sensor mode that can deliver it, but this
@@ -84,7 +96,7 @@ defmodule BB.Camera.Libcamera do
 
   - **Raspberry Pi only**, in practice: `rpicam-vid` is built for the Pi's
     camera stack.
-  - **Timestamps are arrival times.** The MJPEG stream on `rpicam-vid`'s
+  - **Timestamps are arrival times.** The raw stream on `rpicam-vid`'s
     stdout carries no timestamps, so a frame is stamped when the read
     completing it reached the BEAM. See `BB.Camera.FFmpeg.Capture` for what
     that does and does not mean.
@@ -103,11 +115,19 @@ defmodule BB.Camera.Libcamera do
   import BB.Unit.Option
 
   alias BB.Camera.FFmpeg.{Capture, FrameRate}
-  alias BB.Camera.{Frame, Hub, StreamInfo}
+  alias BB.Camera.{Format, Frame, Hub, StreamInfo}
   alias BB.Camera.Libcamera.{Command, Devices}
   alias BB.Error.Hardware.Camera.CaptureFailed
+  alias BB.Error.Invalid.Camera.UnsupportedFormat
 
   require Logger
+
+  @format {:raw, :I420}
+
+  # The Pi 5's ISP pads luma rows to 128 bytes and the Pi 4's to 64, and
+  # `rpicam-vid` writes the padding. One byte per luma pixel, so a width that
+  # is a multiple of this has no padding on either.
+  @row_alignment 128
 
   @impl BB.Sensor
   def options_schema do
@@ -124,22 +144,21 @@ defmodule BB.Camera.Libcamera do
       width: [
         type: :pos_integer,
         default: 640,
-        doc: "Width in pixels to ask for"
+        doc: """
+        Width in pixels. Must be a multiple of 128: `rpicam-vid` writes the
+        ISP's row padding into each frame, and only at those widths is there
+        none. See "Width must be a multiple of 128" above
+        """
       ],
       height: [
         type: :pos_integer,
         default: 480,
-        doc: "Height in pixels to ask for"
+        doc: "Height in pixels. Must be even, for `:I420`'s subsampled chroma"
       ],
       frame_rate: [
         type: FrameRate.option_type(),
         default: 30,
         doc: "Frames per second to ask for; see `BB.Camera.FFmpeg.FrameRate`"
-      ],
-      quality: [
-        type: {:in, 1..100},
-        default: 50,
-        doc: "JPEG quality, 1 to 100. `rpicam-vid`'s own default is 50"
       ],
       hflip: [
         type: :boolean,
@@ -169,11 +188,6 @@ defmodule BB.Camera.Libcamera do
         type: unit_type(compatible: :hertz),
         default: ~u(1 hertz),
         doc: "How often the hub publishes `BB.Message.Camera.CaptureState`"
-      ],
-      max_frame_bytes: [
-        type: :pos_integer,
-        default: 4 * 1024 * 1024,
-        doc: "Largest frame to accept. See `BB.Camera.FFmpeg.Framer`"
       ],
       drop_queue_len: [
         type: :pos_integer,
@@ -219,19 +233,18 @@ defmodule BB.Camera.Libcamera do
   it reads the options and nothing else. Options that still hold unresolved
   parameter references cannot imply a format, and produce an error rather than
   a guess.
+
+  A width `rpicam-vid` would pad - one that isn't a multiple of 128 - is
+  refused, as is an odd height, with `BB.Error.Invalid.Camera.UnsupportedFormat`,
+  reason `:invalid_dimensions`.
   """
   @impl BB.Camera
   def stream_info(opts) do
     with {:ok, width} <- fetch_dimension(opts, :width),
          {:ok, height} <- fetch_dimension(opts, :height),
+         :ok <- check_row_alignment(width, height),
          {:ok, frame_rate} <- fetch_frame_rate(opts) do
-      StreamInfo.new(
-        format: :jpeg,
-        width: width,
-        height: height,
-        frame_rate: frame_rate,
-        metadata: %{pixel_format: nil}
-      )
+      StreamInfo.new(format: @format, width: width, height: height, frame_rate: frame_rate)
     end
   end
 
@@ -258,7 +271,6 @@ defmodule BB.Camera.Libcamera do
          bb: opts[:bb],
          capture: nil,
          command: command,
-         dimensions: nil,
          hub: hub,
          opts: opts,
          pending: nil,
@@ -277,8 +289,8 @@ defmodule BB.Camera.Libcamera do
   def handle_info({:bb_camera, :stop_capture}, state),
     do: {:noreply, request_stop(state, :driver_stopped)}
 
-  def handle_info({:bb_camera_ffmpeg, capture, {:ready, info}}, %{capture: capture} = state),
-    do: {:noreply, confirm(state, info)}
+  def handle_info({:bb_camera_ffmpeg, capture, :ready}, %{capture: capture} = state),
+    do: {:noreply, confirm(state)}
 
   def handle_info({:bb_camera_ffmpeg, capture, event}, %{capture: capture} = state),
     do: {:noreply, handle_capture_event(state, event)}
@@ -298,7 +310,7 @@ defmodule BB.Camera.Libcamera do
 
     Hub.capture_failed(state.hub, %CaptureFailed{camera: camera_name(state), reason: reason})
 
-    {:noreply, run_pending(%{state | capture: nil, dimensions: nil})}
+    {:noreply, run_pending(%{state | capture: nil})}
   end
 
   def handle_info(_message, state), do: {:noreply, state}
@@ -311,7 +323,7 @@ defmodule BB.Camera.Libcamera do
   capture: libcamera configures the camera once, when it starts, so a new size
   or rate means a new `rpicam-vid`. Capture stops and starts again around the
   change; it is not a seamless transition and does not pretend to be. An
-  option that doesn't reach the command line - a framer bound, say - takes
+  option that doesn't reach the command line - a capture bound, say - takes
   effect without disturbing the stream.
 
   **New options this driver cannot use stop the camera.** `handle_options/2`
@@ -393,7 +405,7 @@ defmodule BB.Camera.Libcamera do
 
     Capture.stop(capture)
 
-    %{state | capture: nil, dimensions: nil, stopping: capture, pending: pending}
+    %{state | capture: nil, stopping: capture, pending: pending}
   end
 
   defp queue(state, pending), do: %{state | pending: pending}
@@ -441,8 +453,8 @@ defmodule BB.Camera.Libcamera do
 
   defp start_capture(state) do
     with {:ok, index} <- resolve_camera(state.command),
-         {:ok, capture, dimensions} <- start_capture(state, index) do
-      %{state | capture: capture, dimensions: dimensions}
+         {:ok, capture} <- start_capture(state, index) do
+      %{state | capture: capture}
     else
       {:error, reason} ->
         Hub.capture_failed(state.hub, %CaptureFailed{camera: camera_name(state), reason: reason})
@@ -453,21 +465,22 @@ defmodule BB.Camera.Libcamera do
 
   defp start_capture(state, index) do
     hub = state.hub
+    stream_info = state.stream_info
 
-    # The dimensions the hub has been told about, shared between this process
-    # and the capture process that writes them.
-    dimensions = :atomics.new(2, signed: false)
+    {:ok, frame_bytes} =
+      Format.frame_size(stream_info.format, stream_info.width, stream_info.height)
 
     opts =
       [
         args: Command.argv(state.command, index),
         executable: state.command.executable,
+        frame_bytes: frame_bytes,
         notify: self(),
         sequence_start: state.sequence,
-        sink: fn frame -> deliver(hub, state.stream_info, dimensions, frame) end
+        sink: fn frame -> deliver(hub, stream_info, frame) end
       ] ++ Keyword.take(state.opts, capture_option_keys())
 
-    with {:ok, capture} <- Capture.start_link(opts), do: {:ok, capture, dimensions}
+    Capture.start_link(opts)
   end
 
   defp resolve_camera(%Command{camera: {:index, index}}), do: {:ok, index}
@@ -475,61 +488,34 @@ defmodule BB.Camera.Libcamera do
   defp resolve_camera(%Command{camera: {:id, id}} = command),
     do: Devices.index_of(id, executable: command.executable)
 
-  # Capture is confirmed on the first whole image, not when `rpicam-vid`
+  # Capture is confirmed on the first whole frame, not when `rpicam-vid`
   # starts. The process existing says nothing about whether the camera opened,
   # and a missing camera would otherwise announce `BeginCapture` a moment
   # before it failed.
-  defp confirm(state, info) do
-    stream_info = %{
-      state.stream_info
-      | width: info.width,
-        height: info.height,
-        metadata: Map.put(state.stream_info.metadata, :pixel_format, info.chroma_format)
-    }
-
-    :atomics.put(state.dimensions, 1, info.width)
-    :atomics.put(state.dimensions, 2, info.height)
-
-    Hub.capture_started(state.hub, stream_info)
+  defp confirm(state) do
+    Hub.capture_started(state.hub, state.stream_info)
     Capture.go(state.capture)
 
-    %{state | stream_info: stream_info}
+    state
   end
 
-  defp deliver(hub, declared, dimensions, frame) do
-    known = {:atomics.get(dimensions, 1), :atomics.get(dimensions, 2)}
-
-    if {frame.width, frame.height} != known do
-      Hub.update_stream_info(hub, %{declared | width: frame.width, height: frame.height})
-      :atomics.put(dimensions, 1, frame.width)
-      :atomics.put(dimensions, 2, frame.height)
-    end
-
+  defp deliver(hub, stream_info, frame) do
     Hub.deliver(
       hub,
       Frame.new!(
-        format: :jpeg,
-        width: frame.width,
-        height: frame.height,
+        format: stream_info.format,
+        width: stream_info.width,
+        height: stream_info.height,
         data: frame.data,
         sequence: frame.sequence,
         monotonic_time: frame.monotonic_time,
-        wall_time: frame.wall_time,
-        metadata: frame.metadata
+        wall_time: frame.wall_time
       )
     )
   end
 
   defp handle_capture_event(state, {:exited, status}) do
     Logger.info("rpicam-vid for #{inspect(camera_name(state))} exited with status #{status}")
-
-    state
-  end
-
-  defp handle_capture_event(state, {:discarded, bytes, reason}) do
-    Logger.warning(
-      "#{inspect(camera_name(state))} discarded #{bytes} bytes of capture: #{reason}"
-    )
 
     state
   end
@@ -579,7 +565,6 @@ defmodule BB.Camera.Libcamera do
         :width,
         :height,
         :frame_rate,
-        :quality,
         :hflip,
         :vflip,
         :buffer_count
@@ -597,7 +582,6 @@ defmodule BB.Camera.Libcamera do
       :backend,
       :backend_opts,
       :drop_queue_len,
-      :max_frame_bytes,
       :start_timeout_ms,
       :stdio_window,
       :stop_timeout_ms
@@ -610,6 +594,18 @@ defmodule BB.Camera.Libcamera do
       value when is_integer(value) and value > 0 -> {:ok, value}
       other -> unknown_stream_info({key, other})
     end
+  end
+
+  defp check_row_alignment(width, _height) when rem(width, @row_alignment) == 0, do: :ok
+
+  defp check_row_alignment(width, height) do
+    {:error,
+     UnsupportedFormat.exception(
+       format: @format,
+       width: width,
+       height: height,
+       reason: :invalid_dimensions
+     )}
   end
 
   defp fetch_frame_rate(opts) do
