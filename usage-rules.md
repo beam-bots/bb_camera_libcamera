@@ -8,8 +8,8 @@ SPDX-License-Identifier: Apache-2.0
 
 `bb_camera_libcamera` provides `BB.Camera.Libcamera`, a camera driver for
 Raspberry Pi CSI cameras for [Beam Bots](https://hexdocs.pm/bb). It captures
-MJPEG from libcamera through a supervised `rpicam-vid` process and serves
-frames through `bb_camera`. For framework basics see `bb`'s rules; for the
+raw `{:raw, :I420}` frames from libcamera through a supervised `rpicam-vid`
+process and serves them through `bb_camera`. For framework basics see `bb`'s rules; for the
 consumer-facing API see `bb_camera`'s. This file covers only what is specific
 to this driver.
 
@@ -63,15 +63,24 @@ Pi 5's, and other boards' device-tree paths differ.
 | Option | Default | |
 |---|---|---|
 | `:camera` | `0` | Index, or libcamera id |
-| `:width`, `:height` | `640`, `480` | What to ask for; frames report what was produced |
+| `:width`, `:height` | `640`, `480` | Width a multiple of 128, height even; frames are exactly this size |
 | `:frame_rate` | `30` | Hertz unit, number, or `{numerator, denominator}` |
-| `:quality` | `50` | JPEG quality, 1 to 100 |
 | `:hflip`, `:vflip` | `false` | Both for a camera mounted upside down |
 | `:buffer_count` | `rpicam-vid`'s | Lower to fit several cameras in CMA |
 | `:rpicam_vid` | `$PATH` | Executable path; `libcamera-vid` on older systems |
 
 The remaining options are capture bounds shared with `bb_camera_v4l`; see
 `BB.Camera.Libcamera.options_schema/0`.
+
+## Frame sizes
+
+Width must be a multiple of 128 and height even. `rpicam-vid` writes the
+ISP's row padding into each frame (luma rows padded to 64 bytes on a Pi 4,
+128 on a Pi 5) and doesn't report it, so only those widths give tightly
+packed `:I420`. Any other size is refused with
+`BB.Error.Invalid.Camera.UnsupportedFormat`, reason `:invalid_dimensions` -
+when the sensor starts, or, through a parameter, by stopping the sensor.
+640, 1280 and 1920 work; 800 does not.
 
 ## Failure modes
 
@@ -97,8 +106,9 @@ The remaining options are capture bounds shared with `bb_camera_v4l`; see
   CMA.
 - **Pairing two cameras' frames by timestamp.** Stamps are arrival times in
   the BEAM, not exposure times.
-- **Declaring a parameter looser than the option it feeds.** `-1` stored for
-  `:width` stops the camera, and `handle_options/2` cannot refuse it.
+- **Declaring a parameter looser than the option it feeds.** `-1` or `800`
+  stored for `:width` stops the camera, and `handle_options/2` cannot refuse
+  it.
 - **Starting a `BB.Camera.FFmpeg.Capture` for a camera this driver declares.**
   The driver owns its capture.
 

@@ -16,8 +16,8 @@ SPDX-License-Identifier: Apache-2.0
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/beam-bots/bb_camera_libcamera)
 
 A [Beam Bots](https://github.com/beam-bots/bb) camera driver for Raspberry Pi
-cameras — the CSI ribbon-cable kind — capturing MJPEG from libcamera through a
-supervised `rpicam-vid` process. Boards with more than one camera connector,
+cameras — the CSI ribbon-cable kind — capturing raw `:I420` frames from
+libcamera through a supervised `rpicam-vid` process. Boards with more than one camera connector,
 such as the Pi 5, are supported: declare one sensor per camera.
 
 It is a `BB.Sensor` and a `BB.Camera`, declared like any other sensor:
@@ -66,7 +66,25 @@ rather than from Hex.
   [`bb_camera_ffmpeg`](https://github.com/beam-bots/bb_camera_ffmpeg). Nerves
   toolchains have one.
 - **Not ffmpeg.** This driver uses `bb_camera_ffmpeg` for its capture
-  machinery — MuonTrap, flow control, JPEG framing — but never runs ffmpeg.
+  machinery — MuonTrap, flow control, framing — but never runs ffmpeg.
+
+## Frame sizes: width a multiple of 128
+
+Frames are `{:raw, :I420}` at exactly the configured width and height. The
+width must be a **multiple of 128** and the height **even**; anything else is
+refused when the sensor starts (or when a parameter changes it) with
+`BB.Error.Invalid.Camera.UnsupportedFormat`, reason `:invalid_dimensions`.
+
+The reason is row padding. `rpicam-vid --codec yuv420` writes each of the
+ISP's buffers whole, padding included, and never says how much padding there
+is. The Pi 4's ISP pads each luma row to a multiple of 64 bytes and the Pi
+5's to a multiple of 128, so only at widths that are already a multiple of
+128 is a frame tightly packed `:I420` — which is what `bb_camera` carries,
+and the only thing the stream can be cut into frames by without a marker to
+find. 640, 1280 and 1920 work; 800 does not.
+
+The YUV is full-range BT.601 (sYCC): `rpicam-vid` uses the JPEG colour space
+for this codec, not the limited range most video uses.
 
 ## Choosing a camera
 
@@ -128,8 +146,9 @@ Measured on a Pi 5 under Nerves with 64 MiB of CMA and two imx219s:
 | 1280x720 | default | **no** — the second fails |
 | 1280x720 | `2` | yes, 30 fps each |
 
-`buffer_count: 2` costs headroom: with fewer buffers, a frame the encoder is
-late collecting is a frame dropped. The other fix is more CMA — check
+`buffer_count: 2` costs headroom: with fewer buffers, a frame `rpicam-vid` is
+late writing out is a frame dropped. Raw output doesn't change any of this:
+the ISP's YUV buffers are allocated whatever `rpicam-vid` does with them. The other fix is more CMA — check
 `CmaTotal` in `/proc/meminfo`, and raise it with the `cma=` kernel argument or
 the `cma-` parameter of the `vc4-kms-v3d` overlay, whichever your system uses.
 
@@ -156,19 +175,22 @@ end
 
 BB.subscribe(PiCam, [:sensor, :head, :eye])
 
-{:ok, session} = BB.Camera.Media.open(PiCam, :eye, format: :jpeg)
+{:ok, session} = BB.Camera.Media.open(PiCam, :eye, format: {:raw, :I420})
 {:ok, frame} = BB.Camera.Media.next(session, 10_000)
 
-{frame.width, frame.height, byte_size(frame.data)}
-#=> {1280, 720, 17003}
+{frame.format, frame.width, frame.height, byte_size(frame.data)}
+#=> {{:raw, :I420}, 1280, 720, 1382400}
 
-File.write!("/tmp/camera.jpg", frame.data)
+File.write!("/tmp/camera.yuv", frame.data)
 
 BB.Camera.Media.close(session)
 flush()
 #=> {:bb, [:sensor, :head, :eye], %BB.Message{payload: %BB.Message.Camera.BeginCapture{...}}}
 #=> {:bb, [:sensor, :head, :eye], %BB.Message{payload: %BB.Message.Camera.EndCapture{reason: :no_subscribers, ...}}}
 ```
+
+Copy `/tmp/camera.yuv` somewhere with ffmpeg and look at it with
+`ffplay -f rawvideo -pixel_format yuvj420p -video_size 1280x720 camera.yuv`.
 
 `System.cmd("ps", [])` while the session is open shows one `rpicam-vid` per
 capturing camera, however many consumers there are, and none once the last
@@ -179,13 +201,11 @@ consumer has closed.
 | Option | Default | |
 |---|---|---|
 | `:camera` | `0` | Index or libcamera id, as `Devices.list/1` reports them |
-| `:width`, `:height` | `640`, `480` | Any positive size. libcamera picks a sensor mode and the ISP scales |
+| `:width`, `:height` | `640`, `480` | Width a multiple of 128, height even. libcamera picks a sensor mode and the ISP scales |
 | `:frame_rate` | `30` | A hertz unit, a number, or `{numerator, denominator}` |
-| `:quality` | `50` | JPEG quality, 1 to 100 |
 | `:hflip`, `:vflip` | `false` | Mirror the image. Both together for a camera mounted upside down |
 | `:buffer_count` | `rpicam-vid`'s | Frame buffers to allocate. Lower it to fit several cameras in CMA |
 | `:rpicam_vid` | `$PATH` | Path to the `rpicam-vid` executable |
-| `:max_frame_bytes` | 4 MiB | Largest frame accepted before the stream is resynchronised |
 | `:drop_queue_len` | `8` | Shed frames while more reads than this are waiting |
 | `:stdio_window` | 256 KiB | Bytes of output `rpicam-vid` may have in flight unacknowledged |
 | `:start_timeout_ms` | `10000` | Fail capture when no frame has arrived by then |
@@ -206,28 +226,34 @@ MuonTrap ──> rpicam-vid ──pipe──> Capture ──frames──> BB.Cam
 - **`BB.Camera.Libcamera.Backend`** runs `rpicam-vid` under MuonTrap.
 - **[`bb_camera_ffmpeg`](https://github.com/beam-bots/bb_camera_ffmpeg)**'s
   `Capture` does the rest, as it does for `bb_camera_v4l` and
-  `bb_camera_avf`: flow control, JPEG framing, holding the first frame until
+  `bb_camera_avf`: flow control, cutting the stream into frames by size,
+  holding the first frame until
   the hub has been told capture started, and confirming teardown.
 
 ## Measured on a Pi 5
 
-Two imx219s under Nerves, both at 1280x720 and 30 fps with `buffer_count: 2`:
+Two imx219s under Nerves, both at 1280x720 and 30 fps with `buffer_count: 2`,
+when this driver still captured MJPEG:
 
 - first frame from both cameras within 0.8 s of the consumers opening;
 - 30 fps sustained from each;
-- about 17% of one core per `rpicam-vid`, which is libjpeg encoding;
+- about 17% of one core per `rpicam-vid`, which was libjpeg encoding every
+  frame — the cost raw output removes;
 - `rpicam-vid` exits within 10 ms of `SIGTERM`, and nothing is left running
   after the last consumer closes.
+
+Raw output has not been re-measured. It trades that encode for volume: a
+1280x720 `:I420` frame is 1.3 MiB, so 30 fps is about 40 MiB/s through the
+pipe per camera, where MJPEG was well under 1 MiB/s.
 
 ## Limitations
 
 - **Raspberry Pi only**, in practice: `rpicam-vid` is built for the Pi's
   camera stack. A USB webcam on a Pi wants `bb_camera_v4l`.
-- **Every frame is a software JPEG encode.** The Pi's camera produces raw
-  Bayer data, not JPEG, so there is no passthrough path, and CPU grows with
-  frame size and rate.
+- **Width must be a multiple of 128, height even** — see
+  [Frame sizes](#frame-sizes-width-a-multiple-of-128).
 - **Timestamps are arrival times, not exposure times, and are not suitable for
-  synchronisation.** The MJPEG stream on `rpicam-vid`'s stdout carries no
+  synchronisation.** The raw stream on `rpicam-vid`'s stdout carries no
   timestamps; a frame is stamped when the read completing it reached the BEAM.
   Two cameras' frames cannot be paired by these stamps.
 - **The frame rate is reported as requested.** What the frames actually did is

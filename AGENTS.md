@@ -13,11 +13,12 @@ repository.
 
 `bb_camera_libcamera` is a Beam Bots camera driver for Raspberry Pi cameras.
 One module, `BB.Camera.Libcamera`, is both a `BB.Sensor` and a `BB.Camera`. It
-runs `rpicam-vid --codec mjpeg --output -` and reads the JPEGs off its stdout.
+runs `rpicam-vid --codec yuv420 --output -` and cuts the raw `:I420` frames
+off its stdout by size.
 
-Running the process, flow control, JPEG framing and teardown live in
+Running the process, flow control, framing and teardown live in
 `bb_camera_ffmpeg`, shared with `bb_camera_v4l` and `bb_camera_avf`. That
-package's `Capture` runs any executable that writes concatenated JPEGs to
+package's `Capture` runs any executable that writes fixed-size raw frames to
 stdout; nothing in it is specific to ffmpeg except `Backend.MuonTrap`'s
 `-nostdin` check, which is why this package has a backend of its own.
 
@@ -50,13 +51,13 @@ sibling checkouts.
 
 libcamera is a C++ library. Talking to it from the BEAM directly means a NIF
 or a port program in C++, cross-compiled against the target's libcamera, with
-its own ISP tuning, buffer management and JPEG encoder. `rpicam-vid` is all of
+its own ISP tuning and buffer management. `rpicam-vid` is all of
 that, written and maintained by Raspberry Pi, and ships wherever libcamera
 does on a Pi — Raspberry Pi OS and the Nerves systems that enable rpicam-apps.
 Running it as a subprocess also puts a process boundary between a crashing
 camera stack and the VM.
 
-What that costs: timestamps are arrival times (the MJPEG stream carries none),
+What that costs: timestamps are arrival times (the raw stream carries none),
 camera controls are whatever `rpicam-vid` exposes as flags, and every option
 change restarts the process. A port program would be the answer to any of
 those becoming a requirement.
@@ -107,13 +108,36 @@ not libcamera, so the backend sets `LIBCAMERA_LOG_LEVELS=*:WARN`. Leave
 warnings on: `dmaHeap allocation failure` and `Device or resource busy` are
 the only explanation a user gets.
 
+**Width must be a multiple of 128.** `--codec yuv420` selects rpicam-apps'
+`NullEncoder`, which `fwrite`s each ISP buffer whole: libcamera `YUV420`
+(I420 planar, full-range BT.601), *including* row padding. The Pi 4's
+bcm2835-isp pads luma rows to 64 bytes, the Pi 5's PiSP to 128, and
+`rpicam-vid` reports neither the stride nor an adjusted size (`--verbose 0`
+even hides "Stream configuration adjusted"). Framing is by size alone, so a
+padded frame misaligns every frame after it. `stream_info/1` therefore
+refuses widths that aren't a multiple of 128 with `UnsupportedFormat`
+`:invalid_dimensions` - the same error `bb_camera` uses for an odd `:I420`
+height. This comes from reading rpicam-apps, libcamera and the Raspberry Pi
+kernel's source, not from a Pi; `test/bb/camera/libcamera/rpicam_test.exs`
+checks it on real hardware (one frame of stdout is exactly `frame_size` at
+640 and 1280, and larger at 800). There is no NV12 or RGB `--codec`.
+
+**Nothing but frames may reach stdout.** rpicam-apps logs through `LOG` and
+`LOG_ERROR`, both `std::cerr`; libcamera logs to stderr too. stdout carries
+frames given `--output -`, and otherwise only `--help`, `--version`,
+`--list-cameras` and `--metadata -`, none of which capture passes. The
+backend captures stdout only (`--capture-output` without
+`--capture-stderr`), so stderr stays on the VM's console. Keep it that way.
+Also read from source rather than measured; the `:rpicam` test that counts
+one frame's stdout would catch a stray byte.
+
 **`--flush` is not optional.** Without it frames sit in stdio's buffer and
 arrive in lumps.
 
 **`--framerate` takes a decimal**, not ffmpeg's `num/den`. `Command` converts
 the exact rational to a float at the last moment.
 
-**Capture is confirmed on the first whole image**, not on `rpicam-vid`
+**Capture is confirmed on the first whole frame**, not on `rpicam-vid`
 starting, and stop and start are a sequence. Both work exactly as in
 `bb_camera_v4l`, whose AGENTS.md explains why.
 
@@ -137,8 +161,8 @@ certainly belongs in all of them.
 ## Testing
 
 The test robot declares `BB.Camera.FFmpeg.Test.StubBackend` as its backend,
-and tests feed it images from `BB.Camera.FFmpeg.Test.JpegBuilder`. Both ship
-in `bb_camera_ffmpeg`'s `lib` for exactly this.
+which ships in `bb_camera_ffmpeg`'s `lib` for exactly this, and tests feed it
+raw `:I420` frames of exactly the configured size.
 
 Camera ids are resolved against `test/support/fake_rpicam_vid`, a shell script
 replaying a real Pi 5's `--list-cameras` output — with the first camera busy,
@@ -162,7 +186,7 @@ driver; a robot with no sensors does the same.
 - `bb` — the framework
 - `bb_camera` — the `BB.Camera` behaviour, hub, frame and error types
 - `bb_camera_ffmpeg` — process supervision under MuonTrap, flow control and
-  JPEG framing (not ffmpeg itself, which this driver never runs)
+  framing by size (not ffmpeg itself, which this driver never runs)
 
 ## Licensing headers
 

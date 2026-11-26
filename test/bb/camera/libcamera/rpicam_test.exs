@@ -9,7 +9,8 @@ defmodule BB.Camera.Libcamera.RpicamTest do
   The stubbed suite proves the driver's behaviour, and `bb_camera_ffmpeg`
   proves that capture under MuonTrap leaves nothing behind. Neither proves that
   the argument vector built here is one `rpicam-vid` accepts and turns into
-  JPEGs, or that `BB.Camera.Libcamera.Backend` gets them out. These do.
+  tightly packed `:I420` frames, or that `BB.Camera.Libcamera.Backend` gets
+  them out. These do.
 
   Tagged `:rpicam` and excluded by default: they need a Raspberry Pi with
   `rpicam-vid` and at least one camera attached. Run them there with
@@ -18,6 +19,7 @@ defmodule BB.Camera.Libcamera.RpicamTest do
   use ExUnit.Case, async: false
 
   alias BB.Camera.FFmpeg.Capture
+  alias BB.Camera.Format
   alias BB.Camera.Libcamera.{Backend, Command, Devices}
 
   @moduletag :rpicam
@@ -39,6 +41,7 @@ defmodule BB.Camera.Libcamera.RpicamTest do
   defp start_capture(id, index, command_opts) do
     test = self()
     {:ok, command} = Command.new(command_opts)
+    {:ok, frame_bytes} = frame_bytes(command)
 
     sink = fn frame ->
       send(test, {:frame, id, frame})
@@ -51,6 +54,7 @@ defmodule BB.Camera.Libcamera.RpicamTest do
          executable: command.executable,
          args: Command.argv(command, index),
          backend: Backend,
+         frame_bytes: frame_bytes,
          notify: test,
          sink: sink},
         id: id,
@@ -62,14 +66,40 @@ defmodule BB.Camera.Libcamera.RpicamTest do
     capture
   end
 
-  test "the command produces JPEG frames of the size it asks for" do
+  defp frame_bytes(command), do: Format.frame_size({:raw, :I420}, command.width, command.height)
+
+  # Everything `rpicam-vid` writes to stdout for exactly one frame. Framing is
+  # by size alone, so this has to be one tightly packed frame and nothing else.
+  defp one_frame_of_stdout(command_opts) do
+    {:ok, command} = Command.new(command_opts)
+    argv = Enum.drop(Command.argv(command, 0), -2) ++ ["--frames", "1", "--output", "-"]
+
+    {stdout, 0} = System.cmd(command.executable, argv)
+
+    {stdout, command}
+  end
+
+  test "stdout carries one tightly packed I420 frame per frame, and nothing else" do
+    for {width, height} <- [{640, 480}, {1280, 720}] do
+      {stdout, command} = one_frame_of_stdout(width: width, height: height, frame_rate: 10)
+
+      assert {:ok, byte_size(stdout)} == frame_bytes(command)
+    end
+  end
+
+  test "a width that isn't a multiple of 128 comes out padded, which is why it is refused" do
+    {stdout, command} = one_frame_of_stdout(width: 800, height: 600, frame_rate: 10)
+
+    {:ok, packed} = frame_bytes(command)
+    assert byte_size(stdout) > packed
+  end
+
+  test "the capture delivers frames from the camera" do
     start_capture(:capture, 0, width: 640, height: 480, frame_rate: 10)
 
     # The bound is an upper limit on an event that must happen, not an
     # estimate of how long the camera takes to start.
-    assert_receive {:frame, :capture, frame}, 20_000
-    assert {frame.width, frame.height} == {640, 480}
-    assert <<0xFF, 0xD8, _rest::binary>> = frame.data
+    assert_receive {:frame, :capture, _frame}, 20_000
   end
 
   test "every listed camera captures at the same time", %{devices: devices} do
@@ -90,7 +120,7 @@ defmodule BB.Camera.Libcamera.RpicamTest do
   end
 
   test "a camera that does not exist fails rather than hanging", %{devices: devices} do
-    capture = start_capture(:capture, length(devices), width: 320, height: 240, frame_rate: 10)
+    capture = start_capture(:capture, length(devices), width: 640, height: 480, frame_rate: 10)
 
     Process.unlink(capture)
     monitor = Process.monitor(capture)
