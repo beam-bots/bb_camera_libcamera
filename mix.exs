@@ -9,7 +9,7 @@ defmodule BB.Camera.Libcamera.MixProject do
   Beam Bots camera driver for Raspberry Pi cameras, capturing MJPEG from libcamera via rpicam-vid.
   """
 
-  @version "0.1.0"
+  @version "0.2.0"
 
   def project do
     [
