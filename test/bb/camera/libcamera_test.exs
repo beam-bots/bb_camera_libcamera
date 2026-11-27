@@ -352,6 +352,25 @@ defmodule BB.Camera.LibcameraTest do
 
       assert_receive {:DOWN, ^monitor, :process, ^sensor, :killed}
     end
+
+    test "waits for its capture to exit before going down" do
+      {:ok, _session} = Media.open(StubBot, :eye, format: {:raw, :I420})
+      assert_receive {:stub_opened, stub, _command}
+
+      sensor = BB.Process.whereis(StubBot, :eye)
+      {:ok, hub} = BB.Camera.hub(StubBot, :eye)
+      monitor = Process.monitor(sensor)
+
+      Process.exit(hub, :kill)
+      assert_receive {:stub_stop_requested, ^stub}
+
+      # The driver is waiting in terminate/2 for a capture that cannot exit
+      # before the stub does, so it cannot have gone down yet.
+      refute_received {:DOWN, ^monitor, :process, ^sensor, _reason}
+
+      :ok = StubBackend.exited(stub, 0)
+      assert_receive {:DOWN, ^monitor, :process, ^sensor, :killed}
+    end
   end
 
   describe "the rpicam-vid command" do
